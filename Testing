@@ -2,43 +2,43 @@ for file_path in log_files:
     print(f"--> Processing: {file_path}")
     
     try:
-        # A. Get the Raw Header String (Line 2)
+        # Read file as RDD to handle line numbers
         rdd = spark.sparkContext.textFile(file_path)
-        header_rdd = rdd.zipWithIndex().filter(lambda x: x[1] == 1).map(lambda x: x[0])
+        rdd_indexed = rdd.zipWithIndex()
         
-        # Check if file is valid
+        # ---------------------------------------------------------
+        # A. EXTRACT HEADER (Row 2 -> Index 1)
+        # ---------------------------------------------------------
+        header_rdd = rdd_indexed.filter(lambda x: x[1] == 1).map(lambda x: x[0])
+        
         if header_rdd.isEmpty():
             print("    Skipping: File too short.")
             continue
             
         raw_header_str = header_rdd.first() # e.g., "fields: 'col1', 'col2'"
         
-        # B. Clean the "fields:" prefix
-        # We manually remove the prefix, then turn the clean string back into an RDD
+        # Clean the "fields:" prefix
         if ':' in raw_header_str:
             clean_header_str = raw_header_str.split(':', 1)[1].strip()
         else:
             clean_header_str = raw_header_str.strip()
             
-        # Create a temporary RDD with just this cleaned header line
+        # Parse Header using Spark (Ensures consistency with Data parsing)
         temp_header_rdd = spark.sparkContext.parallelize([clean_header_str])
-
-        # C. Use Spark to Parse the Header (The Fix)
-        # We use the same options here as we will for the data
         df_header_parsed = spark.read.option("header", "false") \
                                      .option("quote", "'") \
                                      .option("escape", "\\") \
                                      .option("ignoreLeadingWhiteSpace", "true") \
                                      .csv(temp_header_rdd)
                                      
-        # Collect the parsed values to a Python list
-        # This handles quotes, spacing, and delimiters exactly like the data reader will
         columns = [c.strip() for c in df_header_parsed.head()]
-        
-        print(f"    Detected {len(columns)} columns: {columns}")
+        print(f"    Detected {len(columns)} columns.")
 
-        # D. Read Data (Lines > 2)
-        data_rdd = rdd.zipWithIndex().filter(lambda x: x[1] > 1).map(lambda x: x[0])
+        # ---------------------------------------------------------
+        # B. EXTRACT DATA (Row 4+ -> Index > 2)  <-- FIXED HERE
+        # ---------------------------------------------------------
+        # We skip Index 0, 1, and 2. Data starts at Index 3.
+        data_rdd = rdd_indexed.filter(lambda x: x[1] > 2).map(lambda x: x[0])
         
         df_data = spark.read.option("header", "false") \
                             .option("quote", "'") \
@@ -46,28 +46,33 @@ for file_path in log_files:
                             .option("ignoreLeadingWhiteSpace", "true") \
                             .csv(data_rdd)
 
-        # E. Final Count Check & Write
+        # ---------------------------------------------------------
+        # C. VALIDATE & WRITE
+        # ---------------------------------------------------------
+        # Check if data exists
+        if len(df_data.head(1)) == 0:
+            print("    Warning: Header found, but no data rows (starting row 4).")
+            continue
+
         if len(df_data.columns) == len(columns):
-            # Perfect match - apply columns
+            # Apply columns
             df_final = df_data.toDF(*columns)
             
             # Add metadata
             df_final = df_final.withColumn("source_filename", F.lit(file_path.split('/')[-1])) \
                                .withColumn("ingestion_date", F.current_timestamp())
 
-            # Write
+            # Write to Delta
             df_final.write.format("delta") \
                 .mode("append") \
                 .option("mergeSchema", "true") \
                 .save(dest_delta_path)
                 
-            print(f"    Success.")
+            print(f"    Success: Appended {df_final.count()} rows.")
             
         else:
-            # Diagnosis Block
             print(f"    ERROR: Mismatch! Header has {len(columns)} cols, Data has {len(df_data.columns)} cols.")
-            print(f"    Header parsed as: {columns}")
-            print(f"    First Data row:   {df_data.head()}")
+            print(f"    Sample Data Row: {df_data.head()}")
 
     except Exception as e:
         print(f"    CRITICAL FAIL: {e}")
