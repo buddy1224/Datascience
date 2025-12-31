@@ -2,79 +2,72 @@ for file_path in log_files:
     print(f"--> Processing: {file_path}")
     
     try:
+        # A. Get the Raw Header String (Line 2)
         rdd = spark.sparkContext.textFile(file_path)
+        header_rdd = rdd.zipWithIndex().filter(lambda x: x[1] == 1).map(lambda x: x[0])
         
-        # Check if file has enough lines
-        if rdd.take(2) == []: 
-            print("    Skipping: File is empty or too short.")
-            continue
-
-        # ---------------------------------------------------------
-        # A. EXTRACT AND CLEAN HEADER (The Fix)
-        # ---------------------------------------------------------
-        # Get the second line (index 1)
-        header_row_list = rdd.zipWithIndex().filter(lambda x: x[1] == 1).map(lambda x: x[0]).collect()
-        
-        if not header_row_list:
-            print("    Skipping: Could not find header line.")
+        # Check if file is valid
+        if header_rdd.isEmpty():
+            print("    Skipping: File too short.")
             continue
             
-        raw_header = header_row_list[0] # e.g. "fields: 'col1', 'col2'"
+        raw_header_str = header_rdd.first() # e.g., "fields: 'col1', 'col2'"
         
-        # 1. Remove the prefix "fields:" (case insensitive)
-        # We split by ':' and take the second part to be safe against different casing of "Fields:"
-        if ':' in raw_header:
-            clean_header_str = raw_header.split(':', 1)[1] 
+        # B. Clean the "fields:" prefix
+        # We manually remove the prefix, then turn the clean string back into an RDD
+        if ':' in raw_header_str:
+            clean_header_str = raw_header_str.split(':', 1)[1].strip()
         else:
-            clean_header_str = raw_header
+            clean_header_str = raw_header_str.strip()
+            
+        # Create a temporary RDD with just this cleaned header line
+        temp_header_rdd = spark.sparkContext.parallelize([clean_header_str])
 
-        # 2. Split by comma to get list
-        raw_cols = clean_header_str.split(',')
+        # C. Use Spark to Parse the Header (The Fix)
+        # We use the same options here as we will for the data
+        df_header_parsed = spark.read.option("header", "false") \
+                                     .option("quote", "'") \
+                                     .option("escape", "\\") \
+                                     .option("ignoreLeadingWhiteSpace", "true") \
+                                     .csv(temp_header_rdd)
+                                     
+        # Collect the parsed values to a Python list
+        # This handles quotes, spacing, and delimiters exactly like the data reader will
+        columns = [c.strip() for c in df_header_parsed.head()]
+        
+        print(f"    Detected {len(columns)} columns: {columns}")
 
-        # 3. Clean each column name: 
-        #    .strip() removes spaces
-        #    .strip("'") removes single quotes
-        #    .strip('"') removes double quotes (just in case)
-        columns = [c.strip().strip("'").strip('"') for c in raw_cols]
-
-        print(f"    Detected Columns: {columns}")
-
-        # ---------------------------------------------------------
-        # B. READ DATA (Skip first 2 lines)
-        # ---------------------------------------------------------
-        # Filter RDD to keep lines > index 1 (skip metadata and header)
+        # D. Read Data (Lines > 2)
         data_rdd = rdd.zipWithIndex().filter(lambda x: x[1] > 1).map(lambda x: x[0])
-
-        # Read CSV data using Spark's robust parser
+        
         df_data = spark.read.option("header", "false") \
-                            .option("inferSchema", "true") \
                             .option("quote", "'") \
                             .option("escape", "\\") \
+                            .option("ignoreLeadingWhiteSpace", "true") \
                             .csv(data_rdd)
 
-        # ---------------------------------------------------------
-        # C. APPLY COLUMNS & WRITE
-        # ---------------------------------------------------------
-        # Handle column mismatch safely
+        # E. Final Count Check & Write
         if len(df_data.columns) == len(columns):
+            # Perfect match - apply columns
             df_final = df_data.toDF(*columns)
+            
+            # Add metadata
+            df_final = df_final.withColumn("source_filename", F.lit(file_path.split('/')[-1])) \
+                               .withColumn("ingestion_date", F.current_timestamp())
+
+            # Write
+            df_final.write.format("delta") \
+                .mode("append") \
+                .option("mergeSchema", "true") \
+                .save(dest_delta_path)
+                
+            print(f"    Success.")
+            
         else:
-            # If data has extra commas, Spark might create more columns than we have headers for
-            print(f"    Warning: Column mismatch! Header has {len(columns)}, Data has {len(df_data.columns)}")
-            # Slice the dataframe to match header length (or keep raw if you prefer debugging)
-            df_final = df_data.select(df_data.columns[:len(columns)]).toDF(*columns)
-
-        # Add metadata columns
-        df_final = df_final.withColumn("source_filename", F.lit(file_path.split('/')[-1])) \
-                           .withColumn("ingestion_date", F.current_timestamp())
-
-        # Write to Delta with Schema Evolution
-        df_final.write.format("delta") \
-            .mode("append") \
-            .option("mergeSchema", "true") \
-            .save(dest_delta_path)
-
-        print(f"    Success: Appended {df_final.count()} rows.")
+            # Diagnosis Block
+            print(f"    ERROR: Mismatch! Header has {len(columns)} cols, Data has {len(df_data.columns)} cols.")
+            print(f"    Header parsed as: {columns}")
+            print(f"    First Data row:   {df_data.head()}")
 
     except Exception as e:
-        print(f"    FAILED processing {file_path}: {e}")
+        print(f"    CRITICAL FAIL: {e}")
