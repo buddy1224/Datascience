@@ -1,3 +1,12 @@
+try:
+    files_list = mssparkutils.fs.ls(source_storage)
+    log_files = [f.path for f in files_list if f.name.endswith('.log')]
+except Exception as e:
+    print(f"Error accessing source path: {e}")
+    log_files = []
+
+print(f"Found {len(log_files)} log files to process.")
+
 for file_path in log_files:
     print(f"--> Processing: {file_path}")
     
